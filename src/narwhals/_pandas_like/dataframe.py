@@ -403,9 +403,20 @@ class PandasLikeDataFrame(
                 # Extract the row values from the named rows
                 return [tuple(row.values()) for row in self.rows(named=True)]
 
-            return list(self.native.itertuples(index=False, name=None))
+            return list(self._iter_rows(buffer_size=512))
 
-        return self.native.to_dict(orient="records")
+        rows = self.native.to_dict(orient="records")
+        if self._implementation.is_pandas() and self._backend_version < (2,):
+            # pandas<2 does not convert pd.NA to None in to_dict.
+            na = self.__native_namespace__().NA
+            if any(
+                getattr(dtype, "na_value", None) is na for dtype in self.native.dtypes
+            ):
+                rows = [
+                    {name: None if value is na else value for name, value in row.items()}
+                    for row in rows
+                ]
+        return rows
 
     def iter_columns(self) -> Iterator[PandasLikeSeries]:
         for _name, series in self.native.items():  # noqa: PERF102
@@ -413,16 +424,49 @@ class PandasLikeDataFrame(
 
     _iter_columns = iter_columns
 
+    def _iter_rows(self, *, buffer_size: int) -> Iterator[tuple[Any, ...]]:
+        if not self._implementation.is_pandas():
+            return self.native.itertuples(index=False, name=None)
+
+        na = self.__native_namespace__().NA
+        nullable_columns = {
+            name
+            for name, dtype in self.native.dtypes.items()
+            if getattr(dtype, "na_value", None) is na
+            and (dtype.kind in "biuf" or str(dtype).startswith("string"))
+        }
+        if not nullable_columns:
+            return self.native.itertuples(index=False, name=None)
+
+        buffer_size = max(buffer_size, 1)
+        columns = [
+            (series, name in nullable_columns) for name, series in self.native.items()
+        ]
+
+        def iter_batches() -> Iterator[tuple[Any, ...]]:
+            for start in range(0, len(self.native), buffer_size):
+                stop = start + buffer_size
+                yield from zip(
+                    *(
+                        series.array[start:stop].to_numpy(dtype=object, na_value=None)
+                        if nullable
+                        else series.iloc[start:stop]
+                        for series, nullable in columns
+                    ),
+                    strict=True,
+                )
+
+        return iter_batches()
+
     def iter_rows(
         self, *, named: bool, buffer_size: int
     ) -> Iterator[tuple[Any, ...]] | Iterator[dict[str, Any]]:
-        # The param ``buffer_size`` is only here for compatibility with the Polars API
-        # and has no effect on the output.
+        rows = self._iter_rows(buffer_size=buffer_size)
         if not named:
-            yield from self.native.itertuples(index=False, name=None)
+            yield from rows
         else:
             col_names = self.native.columns
-            for row in self.native.itertuples(index=False):
+            for row in rows:
                 yield dict(zip(col_names, row, strict=False))
 
     @property
